@@ -368,13 +368,13 @@ Status Attention<T>::RunMemoryEfficientAttention(
   bool broadcast_bias_dim_1 = false;
 
   if (nonpad_kv_seqlen != nullptr) {
-    // Convert nonpad_kv_seqlen to seqlens_k for custom right padding
+    // Convert nonpad_kv_seqlen to seqlens_k for custom right padding.
+    // MEA expects actual token count (not count-1), so use FlashSeqlensK variant.
     auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
-    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToSeqlensK(
+    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToFlashSeqlensK(
         nonpad_kv_seqlen->Data<int64_t>(),
         seqlens_k_buffer.get(),
         parameters.batch_size,
-        parameters.total_sequence_length,
         cuda_stream,
         device_prop.maxThreadsPerBlock));
 
@@ -768,7 +768,8 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
         !has_output_qk &&
         parameters.softcap == 0.0f &&
         parameters.softmax_precision == 0 &&
-        past_key == nullptr;  // Flash with past requires buffer management; use unfused
+        past_key == nullptr &&  // Flash with past requires buffer management; use unfused
+        attn_mask == nullptr;   // Flash prompt path does not support attention mask
 
     if (flash_eligible) {
       return RunFlashAttention(context, Q, K, V, attn_mask, past_key, past_value,
@@ -828,7 +829,11 @@ Status Attention<T>::ComputeGQA(
     const Tensor* nonpad_kv_seqlen,
     Tensor* Y, Tensor* present_key, Tensor* present_value,
     const attention_helper::AttentionParameters& parameters) const {
-  ORT_UNUSED_PARAMETER(nonpad_kv_seqlen);
+  // GQA path does not support nonpad_kv_seqlen (opset 24 inplace KV cache).
+  // Fail loudly rather than silently producing wrong results.
+  ORT_ENFORCE(nonpad_kv_seqlen == nullptr,
+              "nonpad_kv_seqlen is not supported in the GQA path of Attention op. "
+              "Use flash or memory efficient attention instead.");
   // GQA only supports float16 and bfloat16 types
   if constexpr (std::is_same<T, float>::value) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
