@@ -229,7 +229,7 @@ __global__ void ConvertNonpadKvSeqlenToFlashSeqlensKKernel(
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < batch_size) {
     int64_t val = nonpad_kv_seqlen[idx];
-    CUDA_KERNEL_ASSERT(val >= 0);
+    CUDA_KERNEL_ASSERT(val > 0);
     CUDA_KERNEL_ASSERT(val <= static_cast<int64_t>(total_sequence_length));
     val = max(static_cast<int64_t>(0), min(val, static_cast<int64_t>(total_sequence_length)));
     seqlens_k[idx] = static_cast<int>(val);  // count, not index
@@ -274,7 +274,7 @@ __global__ void ConvertNonpadKvSeqlenToAttentionBiasKernel(
     int b = static_cast<int>(idx / (static_cast<int64_t>(q_seq_len) * total_seq_len));
     int t = static_cast<int>(idx % total_seq_len);
     int64_t valid_len = nonpad_kv_seqlen[b];
-    CUDA_KERNEL_ASSERT(valid_len >= 0 && valid_len <= static_cast<int64_t>(total_seq_len));
+    CUDA_KERNEL_ASSERT(valid_len > 0 && valid_len <= static_cast<int64_t>(total_seq_len));
     valid_len = max(static_cast<int64_t>(0), min(valid_len, static_cast<int64_t>(total_seq_len)));
     attention_bias[idx] = (t < static_cast<int>(valid_len)) ? T(0.0f) : T(mask_filter_value);
   }
