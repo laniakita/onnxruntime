@@ -14,6 +14,42 @@ class Attention final : public CudaKernel {
   Attention(const OpKernelInfo& info);
   Status ComputeInternal(OpKernelContext* context) const override;
 
+ private:
+  Status RunFlashAttention(
+      OpKernelContext* context,
+      const Tensor* Q, const Tensor* K, const Tensor* V,
+      const Tensor* attn_mask, const Tensor* past_key, const Tensor* past_value,
+      const Tensor* nonpad_kv_seqlen,
+      Tensor* Y, Tensor* present_key, Tensor* present_value,
+      const attention_helper::AttentionParameters& parameters) const;
+
+  Status RunMemoryEfficientAttention(
+      OpKernelContext* context,
+      const Tensor* Q, const Tensor* K, const Tensor* V,
+      const Tensor* attn_mask, const Tensor* past_key, const Tensor* past_value,
+      const Tensor* nonpad_kv_seqlen,
+      Tensor* Y, Tensor* present_key, Tensor* present_value,
+      const attention_helper::AttentionParameters& parameters) const;
+
+  Status RunUnfusedAttention(
+      OpKernelContext* context,
+      const Tensor* Q, const Tensor* K, const Tensor* V,
+      const Tensor* attn_mask, const Tensor* past_key, const Tensor* past_value,
+      const Tensor* nonpad_kv_seqlen,
+      Tensor* Y, Tensor* present_key, Tensor* present_value,
+      Tensor* output_qk,
+      const attention_helper::AttentionParameters& parameters) const;
+
+  // Preserved GQA dispatch path (routes through contrib GQA kernel).
+  // Will be replaced with the direct dispatch cascade in a follow-up.
+  Status ComputeGQA(
+      OpKernelContext* context,
+      const Tensor* Q, const Tensor* K, const Tensor* V,
+      const Tensor* attn_mask, const Tensor* past_key, const Tensor* past_value,
+      const Tensor* nonpad_kv_seqlen,
+      Tensor* Y, Tensor* present_key, Tensor* present_value,
+      const attention_helper::AttentionParameters& parameters) const;
+
  protected:
   bool is_causal_;
   int kv_num_heads_;
