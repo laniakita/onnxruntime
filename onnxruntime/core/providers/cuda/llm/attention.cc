@@ -305,6 +305,7 @@ Status Attention<T>::RunMemoryEfficientAttention(
         nonpad_kv_seqlen->Data<int64_t>(),
         seqlens_k_buffer.get(),
         parameters.batch_size,
+        parameters.total_sequence_length,
         cuda_stream,
         device_prop.maxThreadsPerBlock));
 
@@ -653,6 +654,9 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
   const Tensor* past_key = context->Input<Tensor>(4);
   const Tensor* past_value = context->Input<Tensor>(5);
   const Tensor* nonpad_kv_seqlen = context->Input<Tensor>(6);  // optional, Opset 24
+
+  ORT_ENFORCE(nonpad_kv_seqlen == nullptr || attn_mask == nullptr,
+              "nonpad_kv_seqlen and attn_mask cannot both be provided.");
 
   attention_helper::AttentionParameters parameters;
   TensorShape y_shape;
