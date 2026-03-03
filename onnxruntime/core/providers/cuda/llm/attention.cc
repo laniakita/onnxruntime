@@ -20,9 +20,10 @@ namespace onnxruntime {
 namespace cuda {
 
 #define REGISTER_KERNEL_TYPED(T)                                      \
-  ONNX_OPERATOR_TYPED_KERNEL_EX(                                      \
+  ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                            \
       Attention,                                                      \
       kOnnxDomain,                                                    \
+      23,                                                             \
       23,                                                             \
       T,                                                              \
       kCudaExecutionProvider,                                         \
@@ -35,6 +36,23 @@ namespace cuda {
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 REGISTER_KERNEL_TYPED(BFloat16)
+
+#define REGISTER_KERNEL_TYPED_24(T)                                   \
+  ONNX_OPERATOR_TYPED_KERNEL_EX(                                      \
+      Attention,                                                      \
+      kOnnxDomain,                                                    \
+      24,                                                             \
+      T,                                                              \
+      kCudaExecutionProvider,                                         \
+      (*KernelDefBuilder::Create())                                   \
+          .TypeConstraint("T1", DataTypeImpl::GetTensorType<T>())     \
+          .TypeConstraint("T2", DataTypeImpl::GetTensorType<T>())     \
+          .TypeConstraint("U", BuildKernelDefConstraints<bool, T>()), \
+      Attention<T>);
+
+REGISTER_KERNEL_TYPED_24(float)
+REGISTER_KERNEL_TYPED_24(MLFloat16)
+REGISTER_KERNEL_TYPED_24(BFloat16)
 
 template <typename T>
 Attention<T>::Attention(const OpKernelInfo& info) : CudaKernel(info) {
@@ -98,11 +116,79 @@ Status Attention<T>::RunFlashAttention(
   }
 
   // Handle nonpad_kv_seqlen: external KV cache path (opset 24)
-  // This path will be fully implemented when nonpad kernels are added in Phase 2.
   if (nonpad_kv_seqlen != nullptr) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
-                           "nonpad_kv_seqlen is not yet supported in RunFlashAttention. "
-                           "This will be enabled with opset 24 registration.");
+    ORT_ENFORCE(parameters.past_sequence_length == 0,
+                "RunFlashAttention with nonpad_kv_seqlen requires K/V to be the full cache "
+                "(past_sequence_length must be 0, got ", parameters.past_sequence_length, ").");
+
+    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToFlashSeqlensK(
+        nonpad_kv_seqlen->Data<int64_t>(),
+        seqlens_k_buffer.get(),
+        parameters.batch_size,
+        parameters.total_sequence_length,
+        cuda_stream,
+        device_prop.maxThreadsPerBlock));
+
+    // K/V are the full cache in BSNH. No new tokens to append (k=nullptr, v=nullptr).
+    ORT_RETURN_IF_ERROR(onnxruntime::flash::mha_fwd_kvcache(
+        device_prop, cuda_stream,
+        const_cast<void*>(static_cast<const void*>(Q->Data<T>())),
+        const_cast<void*>(static_cast<const void*>(K->Data<T>())),
+        const_cast<void*>(static_cast<const void*>(V->Data<T>())),
+        /*k=*/nullptr, /*v=*/nullptr,
+        static_cast<void*>(Y->MutableData<T>()),
+        softmax_lse_buffer.get(),
+        const_cast<void*>(static_cast<const void*>(seqlens_k_buffer.get())),
+        /*rotary_cos=*/nullptr, /*rotary_sin=*/nullptr,
+        /*cache_batch_idx=*/nullptr, /*leftpad_k=*/nullptr,
+        /*head_sink=*/nullptr, /*block_table=*/nullptr,
+        parameters.batch_size, parameters.q_num_heads, parameters.kv_num_heads,
+        parameters.head_size,
+        parameters.q_sequence_length, parameters.kv_sequence_length,
+        /*seqlen_k_new=*/0, /*rotary_dim=*/0,
+        parameters.scale, parameters.softcap,
+        parameters.is_causal, is_bf16, /*use_smooth_softmax=*/false,
+        /*past_bsnh=*/true,
+        static_cast<int>(num_splits),
+        softmax_lse_accum_buffer.get(), out_accum_buffer.get(),
+        /*local_window_size=*/-1, /*is_rotary_interleaved=*/false,
+        /*is_packed_qkv=*/false));
+
+    // Populate present_key/value (BNSH) from external cache K/V (BSNH)
+    if (present_key != nullptr && is_bsnh) {
+      if constexpr (std::is_same_v<T, MLFloat16>) {
+        ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::Transpose_BSNH_to_BNSH(
+            parameters.batch_size, parameters.kv_sequence_length,
+            parameters.kv_num_heads, parameters.head_size,
+            reinterpret_cast<const half*>(K->Data<T>()),
+            reinterpret_cast<half*>(present_key->MutableData<T>()),
+            cuda_stream, device_prop.maxThreadsPerBlock));
+      } else if constexpr (std::is_same_v<T, BFloat16>) {
+        ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::Transpose_BSNH_to_BNSH(
+            parameters.batch_size, parameters.kv_sequence_length,
+            parameters.kv_num_heads, parameters.head_size,
+            K->Data<BFloat16>(), present_key->MutableData<BFloat16>(),
+            cuda_stream, device_prop.maxThreadsPerBlock));
+      }
+    }
+    if (present_value != nullptr && is_bsnh) {
+      if constexpr (std::is_same_v<T, MLFloat16>) {
+        ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::Transpose_BSNH_to_BNSH(
+            parameters.batch_size, parameters.kv_sequence_length,
+            parameters.kv_num_heads, parameters.v_head_size,
+            reinterpret_cast<const half*>(V->Data<T>()),
+            reinterpret_cast<half*>(present_value->MutableData<T>()),
+            cuda_stream, device_prop.maxThreadsPerBlock));
+      } else if constexpr (std::is_same_v<T, BFloat16>) {
+        ORT_RETURN_IF_ERROR(onnxruntime::contrib::cuda::Transpose_BSNH_to_BNSH(
+            parameters.batch_size, parameters.kv_sequence_length,
+            parameters.kv_num_heads, parameters.v_head_size,
+            V->Data<BFloat16>(), present_value->MutableData<BFloat16>(),
+            cuda_stream, device_prop.maxThreadsPerBlock));
+      }
+    }
+    return Status::OK();
   } else if (past_key != nullptr) {
     // Flash kvcache path: flash writes new KV into the cache buffer in-place.
     // We need present_key/value buffers with space for total_sequence_length.
@@ -282,10 +368,50 @@ Status Attention<T>::RunMemoryEfficientAttention(
   bool broadcast_bias_dim_1 = false;
 
   if (nonpad_kv_seqlen != nullptr) {
-    // nonpad_kv_seqlen will be supported when nonpad kernels are added in Phase 2.
-    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
-                           "nonpad_kv_seqlen is not yet supported in RunMemoryEfficientAttention. "
-                           "This will be enabled with opset 24 registration.");
+    // Convert nonpad_kv_seqlen to seqlens_k for custom right padding
+    auto seqlens_k_buffer = GetScratchBuffer<int>(parameters.batch_size, context->GetComputeStream());
+    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToSeqlensK(
+        nonpad_kv_seqlen->Data<int64_t>(),
+        seqlens_k_buffer.get(),
+        parameters.batch_size,
+        parameters.total_sequence_length,
+        cuda_stream,
+        device_prop.maxThreadsPerBlock));
+
+    onnxruntime::contrib::cuda::MemoryEfficientAttentionParams p;
+    p.sm = sm;
+    p.is_half = std::is_same<T, MLFloat16>::value;
+    p.is_bf16 = std::is_same<T, BFloat16>::value;
+    p.is_kv_bsnh = is_bsnh;
+    p.batch_size = parameters.batch_size;
+    p.num_heads = parameters.q_num_heads;
+    p.sequence_length = parameters.q_sequence_length;
+    p.kv_sequence_length = parameters.total_sequence_length;
+    p.max_sequence_length = parameters.total_sequence_length;
+    p.qk_head_size = parameters.head_size;
+    p.v_head_size = parameters.v_head_size;
+    p.causal = parameters.is_causal;
+    p.scale = parameters.scale;
+    p.seqlen_k_ptr = seqlens_k_buffer.get();
+    p.has_custom_right_padding = true;
+    p.query = q_data;
+    p.key = k_data;
+    p.value = v_data;
+    p.attn_bias = nullptr;
+    p.stream = cuda_stream;
+    p.output = Y->MutableData<T>();
+
+    IAllocatorUniquePtr<void> workspace_buffer;
+    if (onnxruntime::contrib::cuda::MemoryEfficientAttentionParams::need_workspace(
+            parameters.v_head_size, sizeof(T) == sizeof(float))) {
+      size_t workspace_bytes = sizeof(float) * parameters.batch_size * parameters.q_sequence_length *
+                               parameters.q_num_heads * parameters.v_head_size;
+      workspace_buffer = GetScratchBuffer<void>(workspace_bytes, context->GetComputeStream());
+      p.workspace = workspace_buffer.get();
+    } else {
+      p.workspace = nullptr;
+    }
+    onnxruntime::contrib::cuda::run_memory_efficient_attention(p);
   } else {
     // Standard MEA path (no nonpad)
     if (attn_mask != nullptr) {
@@ -511,10 +637,25 @@ Status Attention<T>::RunUnfusedAttention(
   // Handle attention mask / nonpad_kv_seqlen → attention_bias
   IAllocatorUniquePtr<void> converted_mask_buffer;
   if (nonpad_kv_seqlen != nullptr) {
-    // nonpad_kv_seqlen will be supported when nonpad kernels are added in Phase 2.
-    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
-                           "nonpad_kv_seqlen is not yet supported in RunUnfusedAttention. "
-                           "This will be enabled with opset 24 registration.");
+    // Convert nonpad_kv_seqlen to additive attention bias: [B, q_seq, total_seq]
+    using NativeCudaT = typename onnxruntime::cuda::OrtToCudaType<T>::type;
+    int64_t bias_elements = static_cast<int64_t>(parameters.batch_size) *
+                            parameters.q_sequence_length *
+                            parameters.total_sequence_length;
+    converted_mask_buffer = GetScratchBuffer<void>(bias_elements * sizeof(NativeCudaT), context->GetComputeStream());
+    ORT_RETURN_IF_ERROR(LaunchConvertNonpadKvSeqlenToAttentionBias<NativeCudaT>(
+        nonpad_kv_seqlen->Data<int64_t>(),
+        reinterpret_cast<NativeCudaT*>(converted_mask_buffer.get()),
+        parameters.batch_size,
+        parameters.q_sequence_length,
+        parameters.total_sequence_length,
+        contribop_parameters.mask_filter_value,
+        cuda_stream,
+        device_prop.maxThreadsPerBlock));
+    data.attention_bias = reinterpret_cast<const CudaT*>(converted_mask_buffer.get());
+    // nonpad bias is [B, q_seq, total_seq] → broadcasts over heads but not batch
+    contribop_parameters.broadcast_attn_bias_dim_0 = false;
+    contribop_parameters.broadcast_attn_bias_dim_1 = true;
   } else if (attn_mask != nullptr) {
     if (attn_mask->IsDataType<bool>()) {
       using NativeCudaT = typename onnxruntime::cuda::OrtToCudaType<T>::type;
@@ -593,7 +734,8 @@ Status Attention<T>::ComputeInternal(OpKernelContext* context) const {
                   Q, K, V, attn_mask, past_key, past_value, nonpad_kv_seqlen,
                   is_causal_, softcap_, softmax_precision_,
                   qk_matmul_output_mode_, kv_num_heads_, q_num_heads_, scale_,
-                  parameters, y_shape, present_key_shape, present_value_shape, output_qk_shape)
+                  parameters, y_shape, present_key_shape, present_value_shape, output_qk_shape,
+                  true /* skip_nonpad_data_validation: data is on GPU */)
                   .IsOK(),
               "Output shapes for Attention could not be computed.");
 
